@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from issuepilot.m2_agent import CodingAgent, ModelResponse, ToolCall
 from issuepilot.m2_tools import CodingTools
 from issuepilot.spark_lite import SparkLiteModel
@@ -45,13 +47,26 @@ def test_agent_writes_code_runs_tests_and_finishes(tmp_path: Path) -> None:
 
 
 def test_agent_returns_tool_errors_to_model(tmp_path: Path) -> None:
+    (tmp_path / "test_ok.py").write_text("def test_ok():\n    assert True\n", encoding="utf-8")
     model = ScriptedModel([
         ModelResponse(tool_calls=(ToolCall("1", "read_file", {"path": "../secret"}),)),
+        ModelResponse(tool_calls=(ToolCall("2", "run_tests", {}),)),
         ModelResponse("Recovered from the tool error."),
     ])
     result = CodingAgent(CodingTools(tmp_path), model).run("Read an invalid path")
     assert result.completed
     assert result.trace[0]["result"]["ok"] is False
+
+
+def test_agent_does_not_finish_after_failed_tests(tmp_path: Path) -> None:
+    (tmp_path / "test_failure.py").write_text("def test_failure():\n    assert False\n", encoding="utf-8")
+    model = ScriptedModel([
+        ModelResponse(tool_calls=(ToolCall("1", "run_tests", {}),)),
+        ModelResponse("Tests are done."),
+    ])
+    result = CodingAgent(CodingTools(tmp_path), model, max_steps=2).run("Make tests pass")
+    assert not result.completed
+    assert result.trace[-1]["result"]["exit_code"] == 1
 
 
 def test_agent_stops_at_max_steps(tmp_path: Path) -> None:
@@ -110,8 +125,9 @@ def test_spark_lite_retries_non_json_response() -> None:
     assert len(calls) == 2
 
 
-def test_spark_lite_retries_empty_final() -> None:
-    responses = iter(['{"final":null}', '{"tool":"list_files","arguments":{}}'])
+@pytest.mark.parametrize("invalid_final", ["null", '"None"', '"null"', '"无"'])
+def test_spark_lite_retries_empty_final(invalid_final: str) -> None:
+    responses = iter([f'{{"final":{invalid_final}}}', '{"tool":"list_files","arguments":{}}'])
 
     class Completions:
         def create(self, **kwargs):

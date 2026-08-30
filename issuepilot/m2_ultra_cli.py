@@ -17,9 +17,16 @@ def main() -> None:
     print(result.content)
     print(f"steps={result.steps}, completed={result.completed}")
     for event in result.trace:
-        print(f"step {event['step']}: {event['tool']}")
+        detail = ""
+        if event["tool"] == "write_file":
+            detail = f" path={event['result'].get('path')}"
+        elif event["tool"] == "run_tests":
+            detail = (
+                f" exit_code={event['result'].get('exit_code')}"
+                f" timed_out={event['result'].get('timed_out')}"
+            )
+        print(f"step {event['step']}: {event['tool']}{detail}")
 
 
 if __name__ == "__main__":
     main()
-
