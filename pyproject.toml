@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "issuepilot"
+version = "0.1.0"
+description = "A minimal read-only repository agent"
+requires-python = ">=3.11"
+
+[project.scripts]
+issuepilot = "issuepilot.cli:main"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+
