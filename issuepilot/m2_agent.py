@@ -1,25 +1,41 @@
 """
-M2 : “下一步做什么”交给支持工具调用的模型决定
+M2 : 让模型决定下一步调用哪个工具，由本地 CodingAgent 执行工具，再把结果交回模型，循环直到任务完成。
 
 可以循环执行：
-接收编程任务
-    ↓
-模型判断下一步
-    ↓
-调用工具查看/搜索/修改代码
-    ↓
-把工具结果交还模型
-    ↓
-模型继续判断
-    ↓
-运行测试并输出答案
+用户提交任务
+   ↓
+CodingAgent建立messages
+   ↓
+进入第1轮
+   ↓
+发送model_request_started事件
+   ↓
+调用模型complete()
+   ↓
+发送model_response_received事件
+   ↓
+模型是否请求工具？
+ ┌──────────┴──────────┐
+ │有                   │没有
+ ▼                     ▼
+_execute()执行工具    检查最近测试是否通过
+ │                ┌────┴────┐
+ ▼                │通过     │未通过
+保存到trace       ▼         ▼
+ │              返回结果   提醒模型继续
+ ▼                          │
+_emit()发送工具事件         │
+ │                          │
+ ▼                          │
+工具结果加入messages         │
+ └────────进入下一轮─────────┘
 """
 
 from __future__ import annotations
 
 import json
 from dataclasses import asdict, dataclass # @dataclass：快速创建数据类  asdict()：把数据类对象转换成字典
-from typing import Any, Protocol # Protocol：定义一个对象需要满足什么接口
+from typing import Any, Callable, Protocol # Protocol：定义一个对象需要满足什么接口
 
 from .m2_tools import CodingTools # CodingAgent 决定调用哪个工具，而真正的读文件、写文件、搜索和测试操作由 CodingTools 完成。
 
@@ -70,13 +86,17 @@ class CodingAgent:
         self,  
         tools: CodingTools,  # 实际操作代码仓库的工具
         model: ToolCallingModel, # 能够做出决策并调用工具的模型
-        max_steps: int = 12 # 最多允许模型决策多少轮，默认12轮
+        max_steps: int = 12, # 最多允许模型决策多少轮，默认12轮
+        event_handler: Callable[[dict[str, Any]], None] | None = None,# 事件处理器 Callable：表示它必须是“可以调用的对象”，通常就是函数。
+        # [[dict[str, Any]], None] ： 表示这个函数：接收一个字典 没有返回值 可以传入一个接收事件字典的函数；如果不需要实时处理事件，可以不传，默认是 None。
     ) -> None:
         # 检查最大步数
         if max_steps < 1:
             raise ValueError("max_steps must be positive")
         # 保存初始化参数
         self.tools, self.model, self.max_steps = tools, model, max_steps
+        # 保存事件处理器
+        self.event_handler = event_handler
 
     # 执行一个编程任务
     def run(self, task: str) -> AgentResult:
@@ -95,8 +115,29 @@ class CodingAgent:
         trace: list[dict[str, Any]] = []
         # 进入循环  每一轮代表模型进行一次决策。它不是“最多调用12次工具”。因为模型每轮可能一次提出多个工具调用，所以实际工具调用次数可能超过12次。
         for step in range(1, self.max_steps + 1):
+            # 模型请求开始 发生在调用模型之前
+            self._emit(
+                {
+                    "step": step,
+                    "tool": "model_request_started",
+                    "arguments": {"message_count": len(messages)},
+                    "result": {"status": "waiting"},
+                }
+            )
             # 请求模型作出决策 messages：完整对话历史 TOOL_SCHEMAS：允许调用的工具说明
             response = self.model.complete(messages, TOOL_SCHEMAS)
+            # 收到模型相应 发生在模型返回之后
+            self._emit(
+                {
+                    "step": step,
+                    "tool": "model_response_received",
+                    "arguments": {},
+                    "result": {
+                        "tool_call_count": len(response.tool_calls), # 模型这一轮返回了多少个工具调用。
+                        "has_content": bool(response.content), # 模型是否返回普通文字
+                    },
+                }
+            )
             # 构造助手消息
             assistant: dict[str, Any] = {"role": "assistant", "content": response.content}
             # 处理模型提出的工具调用
@@ -133,14 +174,23 @@ class CodingAgent:
             for call in response.tool_calls:
                 # 执行工具
                 result = self._execute(call)
-                # 记录执行轨迹
-                trace.append({"step": step, "tool": call.name, "arguments": call.arguments, "result": result})
+                # 创建事件 事件同时用于：trace event_handler
+                event = {"step": step, "tool": call.name, "arguments": call.arguments, "result": result}
+                # 保存轨迹 生在调用事件处理器之前，因此正常情况下轨迹已经保存。
+                trace.append(event)
+                # 调用事件处理器  如果存在回调，就实时通知外部。
+                self._emit(event)
                 # 把工具结果加入对话
                 messages.append(
                     {"role": "tool", "tool_call_id": call.id, "content": json.dumps(result, ensure_ascii=False)}
                 )
         # 如果模型到第12轮仍不断调用工具，循环结束后返回：
         return AgentResult(f"Stopped after reaching max_steps={self.max_steps}.", self.max_steps, False, tuple(trace))
+
+    # 统一事件发送入口
+    def _emit(self, event: dict[str, Any]) -> None:
+        if self.event_handler:
+            self.event_handler(event)
     # 工具分发器
     def _execute(self, call: ToolCall) -> dict[str, Any]:
         # 这个方法根据 call.name 决定调用 CodingTools 中的哪个方法。
@@ -173,12 +223,16 @@ class CodingAgent:
         ) as error:
             return {"ok": False, "error": type(error).__name__, "message": str(error)}
 
-
+# 测试完成检查函数
 def _latest_tests_passed(trace: list[dict[str, Any]]) -> bool:
+    # 找出所有测试调用
     test_events = [event for event in trace if event["tool"] == "run_tests"]
+    # 如果从未测试 模型不能完成任务。
     if not test_events:
         return False
+    # 取最近一次测试
     result = test_events[-1]["result"]
+    # 检查三个条件 必须同时满足：工具调用成功  测试退出码为0  测试没有超时
     return (
         result.get("ok") is True
         and result.get("exit_code") == 0
